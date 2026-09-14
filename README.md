@@ -152,7 +152,8 @@ You can instead keep the pool [inside the project](#in-project-storage) with `--
 - **In-use detection** — treehouse scans running processes and short-lived owner reservations to determine which worktrees are in-use. Reservations are persisted only while `get`, `destroy`, and `prune` lifecycle work is running.
 - **Durable leases** - `treehouse get --lease` reserves a worktree as a persistent home without keeping a process inside it. Each acquisition gets an immutable random lease identity, and the lease is recorded in treehouse's own state. The worktree is never handed out by a later `get` and never removed by `prune` until you release it with `treehouse return`. Unlike process-based in-use detection, a lease survives with zero processes running inside the worktree.
 - **State recovery** - treehouse writes pool state atomically via a temp file and replacement.
-  If an existing state file is empty or truncated, treehouse warns, rebuilds entries from worktrees still on disk, and marks those entries leased until you verify them with `treehouse status`.
+  If an existing state file is empty, truncated, or omits an on-disk worktree, treehouse rebuilds the missing entries and quarantines them for inspection and explicit destruction. See [Recovering missing pool state](#recovering-missing-pool-state).
+- **Gitignored file seeding** — commit a `.worktreeinclude` file for the default selection, or pass `get --include-file <path>` for a personal manifest. Selected local files are copied from the main checkout on each acquire. See [Seeding gitignored files](#seeding-gitignored-files).
 - **Dirty detection** - treehouse treats tracked changes and untracked files as dirty, even when repository config hides untracked files from normal `git status` output.
 - **Safe pruning** - By default, `treehouse prune` removes only idle managed worktrees whose HEAD is already merged into the default branch and whose working tree is clean.
   `treehouse prune --all` applies the same safety checks across every managed pool under the user-level treehouse root.
@@ -167,6 +168,7 @@ You can instead keep the pool [inside the project](#in-project-storage) with `--
 | `treehouse`                | Get a worktree and open a subshell (alias for `get`) |
 | `treehouse get`            | Acquire a worktree from the pool                     |
 | `treehouse get --lease`    | Durably lease a worktree without a subshell; print its path |
+| `treehouse lease <name>`   | Durably lease an existing pool worktree in place, without touching its files or git state |
 | `treehouse enter <name>`   | Open a subshell in an existing worktree by name (the number from `status`), even if it is in use; pool state is left untouched |
 | `treehouse status`         | Show pool status (highlights leased and current worktrees) |
 | `treehouse return [path]`  | Release any lease and return a worktree only after verifying foreign processes stopped |
@@ -185,7 +187,10 @@ You can instead keep the pool [inside the project](#in-project-storage) with `--
 | `get`     | `--lease-holder` | Optional label recorded as the lease holder (defaults to `$TREEHOUSE_LEASE_HOLDER`) |
 | `get`     | `--json` | Print `path`, `lease_id`, `lease_holder`, `leased_at`, and `base_branch` as JSON (requires `--lease`) |
 | `get`     | `--base` | Branch to cut this worktree from, overriding `base_branch` in config |
+| `get`     | `--include-file` | Replace committed `.worktreeinclude` for this acquisition with the supplied manifest |
 | `get`     | `--unique-leaf` | Name a newly created worktree directory `<repo>-<slot>` instead of `<repo>`, overriding `unique_leaf` in config |
+| `lease`   | `--lease-holder` | Optional label recorded as the lease holder (defaults to `$TREEHOUSE_LEASE_HOLDER`) |
+| `lease`   | `--json` | Print `path`, `lease_id`, `lease_holder`, `leased_at`, and `base_branch` as JSON (`base_branch` is best-effort: empty when the slot records no explicit base and its own worktree cannot resolve a default) |
 | `enter`   | `--print-path` | Print only the worktree's absolute path to stdout instead of opening a subshell (for `cd "$(treehouse enter --print-path 1)"`) |
 | `status`  | `--json` | Print worktree status and lease metadata as JSON |
 | `return`  | `--force` | Clean, reset, and return without prompting |
@@ -201,6 +206,33 @@ You can instead keep the pool [inside the project](#in-project-storage) with `--
 | `destroy` | `--include-unlanded` | Also remove dirty, unmerged, or unverified worktrees (irreversible data loss) |
 | `destroy` | `--include-in-use` | Also remove worktrees with a running process or owner reservation (processes are terminated cleanly first) |
 | `destroy` | `--include-leased` | Also remove a leased worktree; only when the exact path is named, never via `--all` |
+
+### Seeding gitignored files
+
+Commit a `.worktreeinclude` file to seed selected gitignored files from the main checkout into each acquired Git worktree or jj workspace. This is useful for local configuration or generated files that every worktree needs but Git should not track. By default, only the committed file at the worktree's HEAD is used; a dirty or untracked `.worktreeinclude` in the main checkout is ignored, and a missing committed file is a no-op.
+
+Manifests use `.gitignore` pattern syntax. A file must be ignored by the repository and selected by the manifest; tracked files and unignored untracked files are never copied. Use `!` to exclude a broader match:
+
+```gitignore
+.env*
+!.env.local
+local-config/
+```
+
+For a personal selection that does not need to be committed, pass an explicit manifest:
+
+```sh
+treehouse get --include-file ./personal.include
+treehouse get --lease --include-file ./personal.include
+```
+
+The supplied manifest **replaces**, rather than extends, committed `.worktreeinclude` for this acquisition, on both new and reused slots. The manifest may be tracked, untracked, or ignored. Relative manifest paths resolve from your current directory; patterns inside the file always select files relative to the main checkout root, not the manifest's directory. There is no config setting or environment variable for this override.
+
+Treehouse reads the supplied file once before acquisition. A missing or unreadable file is an error before any slot is created or reset, with no fallback to the committed manifest. An empty file seeds nothing. Later acquisitions without the flag use the committed default again. Return and reuse remove previously seeded files using Treehouse's recorded inventory, even if the local manifest has changed or been deleted.
+
+Treehouse refreshes selected files whenever it creates or reuses a worktree. On Unix-like systems, it preserves regular-file permissions, including executable bits. A source symlink becomes a regular file containing the symlink target text; Treehouse never follows it or creates a destination symlink. Rooted filesystem operations prevent selected paths and existing destination symlinks from escaping either checkout.
+
+If seeding fails, acquisition fails too. A newly created worktree is removed; if cleanup fails, or if a reused worktree was only partly refreshed, Treehouse records it as leased and quarantined so a later `get` cannot hand it out silently. Inspect it with `treehouse status`. If Treehouse reports that its seeded-file inventory is unknown, remove it with `treehouse destroy <path> --include-leased --yes`; `treehouse return` refuses to reuse it. Other quarantined worktrees can be returned after they are safe to reuse.
 
 ### Leasing a worktree (no subshell)
 
@@ -221,6 +253,14 @@ A bulk `treehouse destroy <pool> --all` never removes it either; only naming its
 
 Pass `--lease-holder <label>` (or set `$TREEHOUSE_LEASE_HOLDER`) to record who holds the lease; `treehouse status` then shows it next to the `leased` state.
 
+`get --lease` can only protect a worktree it acquires itself. To give a worktree that already exists - a long-lived home acquired with plain `get`, or any registered slot that predates leases - the same protection after the fact, lease it in place:
+
+```sh
+treehouse lease 3 --lease-holder secondmate-home
+```
+
+`lease` is state-only: it never resets, fetches, cleans, or checks out the worktree, so it is safe on a slot holding live work. It refuses when the name is unknown, when the registered worktree's directory no longer exists, when the slot is being destroyed, or when it is already leased (naming the holder). Leasing a worktree whose `treehouse get` shell is still running is safe: when that shell exits, `get` sees the slot is no longer its own and leaves it untouched. `treehouse return <path>` releases an in-place lease exactly like an acquired one.
+
 Every acquisition receives a new random `lease_id`, including reacquiring the same path with the same holder. Automation can request a stable machine-readable allocation:
 
 ```sh
@@ -237,11 +277,24 @@ treehouse get --lease --no-fetch --json
 
 With `--no-fetch`, Treehouse resets or creates the worktree from existing local refs and never contacts `origin`. The caller is responsible for ensuring those refs and objects are current.
 
-`treehouse status --json` returns an array with `name`, `path`, `status`, `flavor`, `lease_id`, `lease_holder`, `leased_at`, and `processes`. `flavor` is the backend the worktree's own marker identifies (`"git"` or `"jj"`) and is omitted when no marker is found. Non-leased entries use empty lease strings and a `null` timestamp. State files written before lease identities remain readable; their existing leases have an empty `lease_id` until released and acquired again.
+`treehouse status --json` returns an array with `name`, `path`, `status`, `branch`, `detached`, `branch_error`, `flavor`, `lease_id`, `lease_holder`, `leased_at`, and `processes`. `branch` names the checked-out branch of a git slot on a branch; it is empty for a detached HEAD, a jj slot, and a markerless (damaged) slot. `detached` is `true` only for a git slot on a detached HEAD (the state `treehouse get` leaves by default) and is omitted when false; `branch_error` is set when a slot's branch could not be read, so a read failure is never mistaken for a detached HEAD or an empty branch. `processes` is what `treehouse return` would terminate in that worktree, not every process whose working directory is inside it: the calling process and its ancestors are excluded, so running `status` from inside a pooled worktree reports what is resident in the slot instead of the shell you typed the command into. When the process table itself cannot be read, `status` is `unverified` and `processes` is empty: whether anything is running there is unknown, so the slot is not reported `available`, `dirty`, or `in-use`, and the error is printed as a warning on stderr. A lease, an owner reservation, or the slot you are standing in is still reported as such, because those facts do not depend on the scan. `flavor` is the backend the worktree's own marker identifies (`"git"` or `"jj"`) and is omitted when no marker is found. Non-leased entries use empty lease strings and a `null` timestamp. State files written before lease identities remain readable; their existing leases have an empty `lease_id` until released and acquired again.
 
 Release a lease with `treehouse return <path>`, which terminates lingering processes and verifies that no foreign process remains before it resets the worktree, clears the lease, and returns the worktree to the pool.
 If process termination or that verification fails, the command exits nonzero and leaves the worktree and lease in place instead of recycling a slot that may still be in use.
+A non-interactive dirty return aborts without cleaning: prune will not reclaim that slot. Retry by pasting the printed `treehouse return --force <quoted-path>` hint (shell-quoted so copy-paste does not expand metacharacters). `--force` with no path only works from inside a repository.
 When you pass an explicit path, `treehouse return` can run from outside the repository because it resolves the managed pool from that worktree path.
+
+`treehouse return` exits 0 only when the worktree was actually returned:
+
+| Exit | Meaning |
+| ---- | ------- |
+| `0`  | The worktree was returned and any lease on it was released |
+| `1`  | The return failed: unmet lease conditions, process termination, or reset |
+| `3`  | The worktree was not returned, and is exactly as it was found: it has uncommitted changes and cleaning was declined, or the confirmation could not be answered |
+
+`treehouse get` uses the same exit `3` when its subshell exits and leaves the worktree dirty, because it leaks the slot the same way: the worktree stays dirty, so a later `get` skips it and `prune` will not reclaim it. Exiting a `get` subshell while another session holds a durable lease on that slot is not this case and still exits 0, because a leased slot was never that session's to return.
+
+Exit `3` is separate from `1` because the two need different handling. A failure is worth retrying; an unreturned dirty worktree stays unreturned until someone cleans it or passes `--force`, so a caller that retries on it will loop.
 
 For retry-safe automation, condition the return on the identity from allocation or status:
 
@@ -256,15 +309,18 @@ Treehouse compares supplied conditions while holding the pool state lock. A miss
 
 For backward compatibility, `treehouse return <path>` without either condition keeps its original unconditional path-only behavior. Existing path-only scripts and `treehouse get --lease` stdout are unchanged.
 
-### Recovering a damaged pool state file
+### Recovering missing pool state
 
 Treehouse writes `treehouse-state.json` atomically, so a crash mid-write should leave the previous state file intact.
-If an existing state file is empty or truncated, commands do not fail just because the JSON cannot be parsed.
-They print a warning, rebuild the pool entries from worktree directories still on disk, and mark every recovered entry as `leased` because treehouse cannot know whether it was idle, in-use, or durably leased.
+If an existing state file is empty, truncated, or otherwise invalid, commands do not fail just because the JSON cannot be parsed.
+They print a warning and rebuild the pool entries from worktree directories still on disk.
+Commands also restore an on-disk worktree that is missing from an otherwise valid state file, covering the narrow case where worktree creation succeeded but recording its quarantine failed.
+Every restored entry is marked `leased` because treehouse cannot know whether it was idle, in-use, or durably leased.
 
 Run `treehouse status` to inspect recovered entries.
-After verifying a worktree is safe to reuse, run `treehouse return <path>` to clear the safety lease.
-To delete one instead, name its exact path with `treehouse destroy <path> --include-leased --yes`.
+Treehouse cannot safely return these entries to the pool because recovery cannot reconstruct the trusted inventory of seeded ignored files.
+State written by versions without inventory integrity data, or whose pool-local `treehouse-state.key` is missing or invalid, is handled the same way, including state rewritten after a downgrade.
+After inspecting a recovered worktree, remove it by naming its exact path with `treehouse destroy <path> --include-leased --yes`.
 Bulk `destroy --all` and prune leave recovered entries alone.
 
 ### Pruning stale worktrees and orphans
@@ -452,7 +508,7 @@ Pooled jj workspaces inherit the opt-in from their main repository root, so an u
 
 The backend is resolved on every command, and existing pool slots keep the flavor they were created with: changing the opt-in does not convert worktrees already in the pool.
 `destroy` and `prune` handle each slot by its own flavor (its `.git` or `.jj` marker), so a git worktree is still cleanly deregistered from git even after opting the repository into jj, and vice versa.
-A slot whose marker is missing entirely (a damaged slot) is never reused, reset, or detached; `treehouse status` reports it as `damaged`, `treehouse return` only clears its lease, `prune` reports it as unverifiable, and `treehouse destroy <path> --include-unlanded` removes it.
+A slot whose marker is missing entirely (a damaged slot) is never reused, reset, or detached; `treehouse status` reports it as `damaged`, `treehouse return` only clears its lease, `treehouse lease` still protects it but reports an empty `base_branch` rather than reading one through a fallback backend, `prune` reports it as unverifiable, and `treehouse destroy <path> --include-unlanded` removes it.
 `treehouse get` is flavor-aware too: it only reuses slots matching the backend the repository currently selects, and creates new slots with that backend, so a caller who opted in to jj is never handed a git worktree (or vice versa).
 Old-flavor slots stay in the pool untouched — `treehouse status` marks them and they count toward `max_trees` — until you migrate them: `treehouse destroy` the old slots and re-acquire with `treehouse get`.
 
@@ -501,7 +557,8 @@ This is **opt-in**; the default global store is unchanged. In-project mode:
 ### Hooks
 
 You can run commands automatically at worktree lifecycle points by adding a `[hooks]` section to the user-level config at `~/.config/treehouse/config.toml`.
-Hooks in repo-level `treehouse.toml` are ignored for safety.
+Hooks in repo-level `treehouse.toml` are ignored for safety, so that running treehouse in an untrusted clone cannot execute checked-in shell.
+During a command, treehouse warns once per repo-level `treehouse.toml` on stderr, naming the file and any ignored lifecycle hook keys declared under `[hooks]` rather than dropping them silently.
 `treehouse destroy` always reads `pre_destroy` from the user-level config because it can target a pool by path.
 
 ```toml

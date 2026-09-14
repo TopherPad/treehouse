@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -25,6 +26,11 @@ type leaseJSONResult struct {
 	BaseBranch  string    `json:"base_branch"`
 }
 
+type statusJSONProcessResult struct {
+	PID  int32  `json:"pid"`
+	Name string `json:"name"`
+}
+
 type statusJSONResult struct {
 	Name        string          `json:"name"`
 	Path        string          `json:"path"`
@@ -39,6 +45,7 @@ var (
 	treehouseBin      string
 	exitShellBin      string
 	dirtyMainShellBin string
+	waitShellBin      string
 )
 
 func TestMain(m *testing.M) {
@@ -123,6 +130,56 @@ func main() {
 	buildDirtyMainShell.Stderr = os.Stderr
 	if err := buildDirtyMainShell.Run(); err != nil {
 		panic("failed to build dirty-main-shell: " + err.Error())
+	}
+
+	// Build a shell that stays alive until the test releases it: it records
+	// its worktree cwd in $TREEHOUSE_TEST_READY, then waits for
+	// $TREEHOUSE_TEST_RELEASE to appear. It lets a test act on a worktree
+	// while the acquiring "treehouse get" is still running.
+	waitShellBin = filepath.Join(buildDir, "wait-shell")
+	if runtime.GOOS == "windows" {
+		waitShellBin += ".exe"
+	}
+	waitSrcDir := filepath.Join(buildDir, "wait-shell-src")
+	if err := os.MkdirAll(waitSrcDir, 0o755); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(filepath.Join(waitSrcDir, "go.mod"), []byte("module wait-shell\n\ngo 1.21\n"), 0o644); err != nil {
+		panic(err)
+	}
+	if err := os.WriteFile(filepath.Join(waitSrcDir, "main.go"), []byte(`package main
+
+import (
+	"os"
+	"time"
+)
+
+func main() {
+	cwd, err := os.Getwd()
+	if err != nil {
+		os.Exit(1)
+	}
+	if err := os.WriteFile(os.Getenv("TREEHOUSE_TEST_READY"), []byte(cwd), 0o644); err != nil {
+		os.Exit(1)
+	}
+	release := os.Getenv("TREEHOUSE_TEST_RELEASE")
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(release); err == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	os.Exit(1)
+}
+`), 0o644); err != nil {
+		panic(err)
+	}
+	buildWaitShell := exec.Command("go", "build", "-o", waitShellBin, ".")
+	buildWaitShell.Dir = waitSrcDir
+	buildWaitShell.Stderr = os.Stderr
+	if err := buildWaitShell.Run(); err != nil {
+		panic("failed to build wait-shell: " + err.Error())
 	}
 
 	code := m.Run()
@@ -509,6 +566,9 @@ func TestGetAndStatus(t *testing.T) {
 	if !strings.Contains(statusOut, "available") {
 		t.Errorf("expected 'available' in status output: %s", statusOut)
 	}
+	if !strings.Contains(statusOut, "(detached)") {
+		t.Errorf("expected '(detached)' in status output: %s", statusOut)
+	}
 }
 
 func TestGetStartsBashAsInteractiveLoginShell(t *testing.T) {
@@ -671,6 +731,148 @@ func TestGetLeaseAndStatusJSONContracts(t *testing.T) {
 	}
 }
 
+func TestGetIncludeFileReplacesCommittedManifest(t *testing.T) {
+	for _, backend := range []string{"git", "jj"} {
+		t.Run(backend, func(t *testing.T) {
+			if backend == "jj" {
+				requireJJ(t)
+				isolateJJConfig(t)
+			}
+			env := []string{"TREEHOUSE_VCS=" + backend}
+			repoDir, homeDir := setupTestRepo(t)
+			// Keep tracked-file byte assertions independent of the host's checkout conversion.
+			gitCmd(t, repoDir, "config", "core.autocrlf", "false")
+			for name, contents := range map[string]string{
+				".gitignore":       "*.seed\n",
+				".worktreeinclude": "default.seed\n",
+				"default.seed":     "default\n",
+				"local.seed":       "local\n",
+			} {
+				if err := os.WriteFile(filepath.Join(repoDir, name), []byte(contents), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			gitCmd(t, repoDir, "add", ".gitignore", ".worktreeinclude")
+			gitCmd(t, repoDir, "commit", "-m", "configure seeds")
+			gitCmd(t, repoDir, "push", "origin", "main")
+			if backend == "jj" {
+				jjCmd(t, repoDir, "git", "init", "--colocate")
+			}
+			if err := os.WriteFile(filepath.Join(repoDir, "README.md"), []byte("private tracked edit\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(repoDir, "notes.txt"), []byte("unignored\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			subdir := filepath.Join(repoDir, "subdir")
+			if err := os.Mkdir(subdir, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			manifestPath := filepath.Join(subdir, "personal.include")
+			if err := os.WriteFile(manifestPath, []byte("local.seed\nREADME.md\nnotes.txt\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			stdout, stderr, code := runTreehouseFromDir(t, repoDir, subdir, homeDir, env,
+				"get", "--lease", "--json", "--include-file", "personal.include")
+			if code != 0 {
+				t.Fatalf("get with local manifest failed: %s", stderr)
+			}
+			var lease leaseJSONResult
+			if err := json.Unmarshal([]byte(stdout), &lease); err != nil {
+				t.Fatalf("invalid lease JSON %q: %v", stdout, err)
+			}
+			for name, want := range map[string]string{"local.seed": "local\n", "README.md": "hello\n"} {
+				got, err := os.ReadFile(filepath.Join(lease.Path, name))
+				if err != nil || string(got) != want {
+					t.Fatalf("%s = %q, %v; want %q", name, got, err, want)
+				}
+			}
+			for _, name := range []string{"default.seed", "notes.txt"} {
+				if _, err := os.Stat(filepath.Join(lease.Path, name)); !os.IsNotExist(err) {
+					t.Fatalf("override copied excluded file %s: %v", name, err)
+				}
+			}
+
+			// Return must rely on the copied-file inventory, not reread a local manifest.
+			if err := os.Remove(manifestPath); err != nil {
+				t.Fatal(err)
+			}
+			if _, stderr, code := runTreehouse(t, repoDir, homeDir, env, "return", lease.Path); code != 0 {
+				t.Fatalf("return failed after deleting manifest: %s", stderr)
+			}
+			if _, err := os.Stat(filepath.Join(lease.Path, "local.seed")); !os.IsNotExist(err) {
+				t.Fatalf("local seed survived return: %v", err)
+			}
+			if err := os.WriteFile(manifestPath, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			stdout, stderr, code = runTreehouse(t, repoDir, homeDir, env,
+				"get", "--lease", "--include-file", manifestPath)
+			if code != 0 || strings.TrimSpace(stdout) != lease.Path {
+				t.Fatalf("empty override did not reuse slot: stdout=%q stderr=%s", stdout, stderr)
+			}
+			for _, name := range []string{"local.seed", "default.seed"} {
+				if _, err := os.Stat(filepath.Join(lease.Path, name)); !os.IsNotExist(err) {
+					t.Fatalf("empty override seeded %s: %v", name, err)
+				}
+			}
+			if _, stderr, code := runTreehouse(t, repoDir, homeDir, env, "return", lease.Path); code != 0 {
+				t.Fatalf("return failed: %s", stderr)
+			}
+			stdout, stderr, code = runTreehouse(t, repoDir, homeDir, env, "get", "--lease")
+			if code != 0 || strings.TrimSpace(stdout) != lease.Path {
+				t.Fatalf("default acquisition did not reuse slot: stdout=%q stderr=%s", stdout, stderr)
+			}
+			got, err := os.ReadFile(filepath.Join(lease.Path, "default.seed"))
+			if err != nil || string(got) != "default\n" {
+				t.Fatalf("default selection was not restored: %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestGetIncludeFileReadFailureLeavesPoolUntouched(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	// A directory is unreadable as a manifest even when tests run as root.
+	for _, manifest := range []string{filepath.Join(repoDir, "missing.include"), repoDir, ""} {
+		stdout, stderr, code := runTreehouse(t, repoDir, homeDir, nil,
+			"get", "--lease", "--include-file", manifest)
+		if code == 0 || stdout != "" {
+			t.Fatalf("invalid manifest %q acquired a slot: stdout=%q stderr=%s", manifest, stdout, stderr)
+		}
+	}
+	stdout, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "status", "--json")
+	if code != 0 {
+		t.Fatalf("status failed: %s", stderr)
+	}
+	var slots []statusJSONResult
+	if err := json.Unmarshal([]byte(stdout), &slots); err != nil || len(slots) != 0 {
+		t.Fatalf("invalid manifests changed pool: %s, %v", stdout, err)
+	}
+
+	stdout, stderr, code = runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("get failed: %s", stderr)
+	}
+	wtPath := strings.TrimSpace(stdout)
+	if _, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "return", wtPath); code != 0 {
+		t.Fatalf("return failed: %s", stderr)
+	}
+	sentinel := filepath.Join(wtPath, "keep.txt")
+	if err := os.WriteFile(sentinel, []byte("untouched\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code = runTreehouse(t, repoDir, homeDir, nil,
+		"get", "--lease", "--include-file", filepath.Join(repoDir, "missing.include"))
+	if code == 0 || stdout != "" {
+		t.Fatalf("invalid manifest acquired a slot: stdout=%q stderr=%s", stdout, stderr)
+	}
+	got, err := os.ReadFile(sentinel)
+	if err != nil || string(got) != "untouched\n" {
+		t.Fatalf("failed acquisition changed existing slot: %q, %v", got, err)
+	}
+}
+
 func TestGetJSONRequiresLease(t *testing.T) {
 	repoDir, homeDir := setupTestRepo(t)
 
@@ -720,6 +922,280 @@ func TestLeasedWorktreeSkippedByGetAndPrune(t *testing.T) {
 	}
 	if _, err := os.Stat(leasedPath); err != nil {
 		t.Fatalf("prune removed leased worktree %s: %v", leasedPath, err)
+	}
+}
+
+// TestLeaseExistingProtectsUnleasedWorktreeInPlace covers 'treehouse lease <name>':
+// durably leasing a registered, unleased, in-use worktree must be state-only,
+// must make get --lease hand out a different slot, must be released by return,
+// and must refuse unknown names, already-leased targets, and bad arg counts.
+func TestLeaseExistingProtectsUnleasedWorktreeInPlace(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	env := []string{"SHELL=" + exitShellBin}
+
+	// Create a registered, unleased worktree the way a long-lived agent home
+	// comes to exist: a plain get whose shell exits and returns the slot to the
+	// pool still registered.
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get failed (code %d): %s", code, getErr)
+	}
+	wtPath := extractWorktreePath(getErr, homeDir)
+	if wtPath == "" {
+		t.Fatal("could not extract worktree path")
+	}
+
+	// Uncommitted home state: leasing must be state-only, so this file must
+	// survive it untouched.
+	homeMarker := filepath.Join(wtPath, "agent-home.txt")
+	if err := os.WriteFile(homeMarker, []byte("home\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Lease from inside the worktree. The get above ran a shell that exits
+	// immediately, so the slot is registered and idle here; the live-owner
+	// case is covered by TestLeaseSurvivesTheAcquiringSessionExiting.
+	stdout, leaseErr, code := runTreehouseFromDir(t, repoDir, wtPath, homeDir,
+		[]string{"TREEHOUSE_LEASE_HOLDER=secondmate-home"}, "lease", "1")
+	if code != 0 {
+		t.Fatalf("lease 1 failed (code %d): %s", code, leaseErr)
+	}
+	if strings.TrimSpace(stdout) != wtPath {
+		t.Fatalf("lease printed %q, want the worktree path %q", stdout, wtPath)
+	}
+	if _, err := os.Stat(homeMarker); err != nil {
+		t.Fatalf("lease must not touch the worktree, marker missing: %v", err)
+	}
+
+	// status shows the worktree leased with the recorded holder.
+	statusOut, statusErr, code := runTreehouse(t, repoDir, homeDir, nil, "status", "--json")
+	if code != 0 {
+		t.Fatalf("status --json failed (code %d): %s", code, statusErr)
+	}
+	var entries []statusJSONResult
+	if err := json.Unmarshal([]byte(statusOut), &entries); err != nil {
+		t.Fatalf("status --json returned invalid JSON: %v\n%s", err, statusOut)
+	}
+	var leased *statusJSONResult
+	for i := range entries {
+		if entries[i].Name == "1" {
+			leased = &entries[i]
+		}
+	}
+	if leased == nil {
+		t.Fatalf("worktree 1 missing from status:\n%s", statusOut)
+	}
+	if leased.Status != "leased" || leased.LeaseHolder != "secondmate-home" || leased.LeaseID == "" || leased.LeasedAt == nil {
+		t.Fatalf("expected worktree 1 leased with holder and identity, got %+v", *leased)
+	}
+
+	// A later get --lease must never hand out the leased worktree.
+	secondOut, secondErr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("get --lease after lease failed (code %d): %s", code, secondErr)
+	}
+	if strings.TrimSpace(secondOut) == wtPath {
+		t.Fatalf("get --lease handed out the in-place leased worktree %s", wtPath)
+	}
+
+	// Refusals.
+	_, unknownErr, code := runTreehouse(t, repoDir, homeDir, nil, "lease", "999")
+	if code == 0 || !strings.Contains(unknownErr, "no worktree named") {
+		t.Fatalf("expected unknown-name refusal, code=%d stderr=%q", code, unknownErr)
+	}
+	_, againErr, code := runTreehouse(t, repoDir, homeDir, nil, "lease", "1")
+	if code == 0 || !strings.Contains(againErr, "already leased") || !strings.Contains(againErr, "secondmate-home") {
+		t.Fatalf("expected already-leased refusal naming the holder, code=%d stderr=%q", code, againErr)
+	}
+	if _, noArgsErr, code := runTreehouse(t, repoDir, homeDir, nil, "lease"); code == 0 {
+		t.Fatalf("expected refusal for missing name, code=0 stderr=%q", noArgsErr)
+	}
+	if _, twoArgsErr, code := runTreehouse(t, repoDir, homeDir, nil, "lease", "1", "2"); code == 0 {
+		t.Fatalf("expected refusal for two names, code=0 stderr=%q", twoArgsErr)
+	}
+
+	// return releases the in-place lease exactly as it releases an acquired one.
+	// --force because the marker file leaves the worktree dirty by construction.
+	_, returnErr, code := runTreehouse(t, repoDir, homeDir, nil, "return", "--force", wtPath)
+	if code != 0 {
+		t.Fatalf("return of in-place lease failed (code %d): %s", code, returnErr)
+	}
+	statusOut, _, code = runTreehouse(t, repoDir, homeDir, nil, "status", "--json")
+	if code != 0 {
+		t.Fatalf("status --json after return failed (code %d)", code)
+	}
+	entries = nil
+	if err := json.Unmarshal([]byte(statusOut), &entries); err != nil {
+		t.Fatalf("status --json returned invalid JSON: %v", err)
+	}
+	for _, e := range entries {
+		if e.Name == "1" && e.Status == "leased" {
+			t.Fatalf("expected worktree 1 to be released, still leased: %+v", e)
+		}
+	}
+}
+
+// TestLeaseJSONReportsResolvedBaseBranch pins the resolved-base case of
+// LeaseInfo.BaseBranch on a slot that recorded no explicit base: a git slot
+// whose own backend answers "main". The field is best-effort on this path, so
+// an empty value where the slot is markerless or its backend cannot resolve a
+// default is the documented contract, not a regression.
+func TestLeaseJSONReportsResolvedBaseBranch(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	env := []string{"SHELL=" + exitShellBin}
+
+	if _, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get"); code != 0 {
+		t.Fatalf("get failed (code %d): %s", code, getErr)
+	}
+
+	stdout, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "lease", "1", "--json")
+	if code != 0 {
+		t.Fatalf("lease 1 --json failed (code %d): %s", code, stderr)
+	}
+	var lease leaseJSONResult
+	if err := json.Unmarshal([]byte(stdout), &lease); err != nil {
+		t.Fatalf("invalid JSON %q: %v", stdout, err)
+	}
+	if lease.BaseBranch != "main" {
+		t.Errorf("base_branch = %q, want main", lease.BaseBranch)
+	}
+	if lease.LeaseID == "" {
+		t.Errorf("lease_id is empty in %q", stdout)
+	}
+}
+
+// TestLeaseRefusesStaleRegisteredWorktree covers a state entry whose worktree
+// directory is gone: lease must refuse rather than record a durable
+// reservation, and print no path, for a home that does not exist.
+func TestLeaseRefusesStaleRegisteredWorktree(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	env := []string{"SHELL=" + exitShellBin}
+
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get failed (code %d): %s", code, getErr)
+	}
+	wtPath := extractWorktreePath(getErr, homeDir)
+	if wtPath == "" {
+		t.Fatal("could not extract worktree path")
+	}
+	if err := os.RemoveAll(wtPath); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "lease", "1")
+	if code == 0 {
+		t.Fatalf("expected a refusal for a stale entry, got exit 0 with stdout %q", stdout)
+	}
+	if strings.TrimSpace(stdout) != "" {
+		t.Fatalf("a refusal must print no path, got stdout %q", stdout)
+	}
+	if !strings.Contains(stderr, "no longer exists") {
+		t.Fatalf("expected the refusal to name the missing directory, got %q", stderr)
+	}
+}
+
+// TestLeaseSurvivesTheAcquiringSessionExiting covers the live agent home: a
+// worktree acquired with plain 'treehouse get' is leased in place WHILE that
+// get's shell is still running. When the shell exits, get must not reset the
+// worktree or clear the lease it no longer owns.
+func TestLeaseSurvivesTheAcquiringSessionExiting(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	signals := t.TempDir()
+	readyFile := filepath.Join(signals, "ready")
+	releaseFile := filepath.Join(signals, "release")
+
+	getCmd := exec.Command(treehouseBin, "get")
+	getCmd.Dir = repoDir
+	getCmd.Env = buildEnv(homeDir,
+		"SHELL="+waitShellBin,
+		"TREEHOUSE_TEST_READY="+readyFile,
+		"TREEHOUSE_TEST_RELEASE="+releaseFile,
+	)
+	var getOut, getErrBuf bytes.Buffer
+	getCmd.Stdout = &getOut
+	getCmd.Stderr = &getErrBuf
+	if err := getCmd.Start(); err != nil {
+		t.Fatalf("failed to start get: %v", err)
+	}
+	t.Cleanup(func() {
+		os.WriteFile(releaseFile, nil, 0o644)
+		getCmd.Wait()
+	})
+
+	// The shell records the worktree it was spawned in and then blocks, so the
+	// slot is held by a LIVE owner reservation for the rest of this test.
+	var wtPath string
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(readyFile); err == nil && len(b) > 0 {
+			wtPath = string(b)
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if wtPath == "" {
+		t.Fatalf("the get subshell never reported its worktree; get stderr: %s", getErrBuf.String())
+	}
+
+	// Committed work in the home, which the exit-time reset would discard. It
+	// is committed rather than left uncommitted so the return reaches the reset
+	// instead of stopping at get's dirty-worktree prompt.
+	homeMarker := filepath.Join(wtPath, "agent-home.txt")
+	if err := os.WriteFile(homeMarker, []byte("home\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, wtPath, "add", "agent-home.txt")
+	gitCmd(t, wtPath, "commit", "-m", "agent home work")
+
+	if _, leaseErr, code := runTreehouse(t, repoDir, homeDir,
+		[]string{"TREEHOUSE_LEASE_HOLDER=live-home"}, "lease", "1"); code != 0 {
+		t.Fatalf("lease of a live worktree failed (code %d): %s", code, leaseErr)
+	}
+
+	// Release the shell; get now reaches its exit-time return.
+	if err := os.WriteFile(releaseFile, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := getCmd.Wait(); err != nil {
+		t.Fatalf("get exited with an error: %v\nstderr: %s", err, getErrBuf.String())
+	}
+
+	if _, err := os.Stat(homeMarker); err != nil {
+		t.Fatalf("get reset the leased worktree, its committed work is gone: %v\nget stderr: %s", err, getErrBuf.String())
+	}
+
+	// The bail-out must say the slot was PROTECTED, not discarded: the lease
+	// path zeroes the owner fields too, so reporting the empty reservation
+	// would tell the operator their home was released when it was leased.
+	bailout := getErrBuf.String()
+	if !strings.Contains(bailout, "durably leased") || !strings.Contains(bailout, "live-home") {
+		t.Errorf("get must report the slot as durably leased and name the holder, got stderr: %s", bailout)
+	}
+	if strings.Contains(bailout, "already released") || strings.Contains(bailout, "another session") {
+		t.Errorf("get mislabelled the leased slot, got stderr: %s", bailout)
+	}
+
+	statusOut, statusErr, code := runTreehouse(t, repoDir, homeDir, nil, "status", "--json")
+	if code != 0 {
+		t.Fatalf("status --json failed (code %d): %s", code, statusErr)
+	}
+	var entries []statusJSONResult
+	if err := json.Unmarshal([]byte(statusOut), &entries); err != nil {
+		t.Fatalf("status --json returned invalid JSON: %v\n%s", err, statusOut)
+	}
+	var leased *statusJSONResult
+	for i := range entries {
+		if entries[i].Name == "1" {
+			leased = &entries[i]
+		}
+	}
+	if leased == nil {
+		t.Fatalf("worktree 1 missing from status:\n%s", statusOut)
+	}
+	if leased.Status != "leased" || leased.LeaseHolder != "live-home" {
+		t.Fatalf("get cleared the in-place lease, got %+v\nget stderr: %s", *leased, getErrBuf.String())
 	}
 }
 
@@ -912,8 +1388,13 @@ func TestReturnConditionalDirtyPromptDoesNotHoldPoolLock(t *testing.T) {
 	if err := stdin.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := returnProcess.Wait(); err != nil {
-		t.Fatalf("aborted return failed: %v", err)
+	err = returnProcess.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected a declined return to exit non-zero, got: %v", err)
+	}
+	if exitErr.ExitCode() != ExitNotReturned {
+		t.Fatalf("expected a declined return to exit %d, got %d", ExitNotReturned, exitErr.ExitCode())
 	}
 }
 
@@ -1235,14 +1716,14 @@ func TestGetDetachesWorktreeWhenLeavingDirty(t *testing.T) {
 
 	env := []string{"SHELL=" + dirtyMainShellBin}
 	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
-	if code != 0 {
-		t.Fatalf("get failed (code %d): %s", code, getErr)
+	if code != ExitNotReturned {
+		t.Fatalf("expected get to report the dirty slot as not returned (%d), got %d: %s", ExitNotReturned, code, getErr)
 	}
 	wtPath := extractWorktreePath(getErr, homeDir)
 	if wtPath == "" {
 		t.Fatal("could not extract worktree path")
 	}
-	if !strings.Contains(getErr, "Worktree left dirty") {
+	if !strings.Contains(getErr, "worktree left dirty") {
 		t.Fatalf("expected get to leave dirty worktree for this regression, got: %s", getErr)
 	}
 
@@ -1251,6 +1732,52 @@ func TestGetDetachesWorktreeWhenLeavingDirty(t *testing.T) {
 	}
 	if out, err := gitCmdResult(t, repoDir, "checkout", "main"); err != nil {
 		t.Fatalf("expected main repo to checkout main after dirty worktree exit, got: %v\n%s", err, out)
+	}
+}
+
+func TestReturnNonTTYDirtyExplainsUnreclaimableSlot(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	env := []string{"SHELL=" + exitShellBin}
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get failed (code %d): %s", code, getErr)
+	}
+	wtPath := extractWorktreePath(getErr, homeDir)
+	if wtPath == "" {
+		t.Fatal("could not extract worktree path")
+	}
+
+	if err := os.WriteFile(filepath.Join(wtPath, "README.md"), []byte("dirty\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, returnErr, code := runTreehouse(t, repoDir, homeDir, nil, "return", wtPath)
+	if code != ExitNotReturned {
+		t.Fatalf("expected non-TTY dirty abort to exit %d, got %d: %s", ExitNotReturned, code, returnErr)
+	}
+	t.Logf("non-TTY dirty abort stderr:\n%s", returnErr)
+	if !strings.Contains(returnErr, "prune will not reclaim this slot") {
+		t.Fatalf("expected unreclaimable-slot explanation, got: %s", returnErr)
+	}
+	if !strings.Contains(returnErr, "return --force") {
+		t.Fatalf("expected --force hint, got: %s", returnErr)
+	}
+	// Hint must be pasteable: "Use treehouse return --force <quoted-path> ..."
+	// with no outer decorative quotes wrapping the whole command.
+	if !strings.Contains(returnErr, "Use treehouse return --force ") {
+		t.Fatalf("expected undecorated --force hint, got: %s", returnErr)
+	}
+	if strings.Contains(returnErr, "Use 'treehouse return --force") {
+		t.Fatalf("hint must not wrap the retry command in decorative quotes, got: %s", returnErr)
+	}
+	if !strings.Contains(returnErr, wtPath) {
+		t.Fatalf("expected --force hint to include worktree path %q, got: %s", wtPath, returnErr)
+	}
+
+	status := gitCmd(t, wtPath, "status", "--porcelain")
+	if status == "" {
+		t.Fatal("expected worktree to stay dirty after non-TTY abort")
 	}
 }
 
@@ -2236,4 +2763,253 @@ func TestEnterPrintPathPrintsOnlyPathToStdout(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(path, "README.md")); err != nil {
 		t.Errorf("printed path is not a valid worktree: %s (%v)", path, err)
 	}
+}
+
+// The failure this exit code exists for: a dirty leased worktree that a
+// non-interactive caller cannot confirm. Exit 0 told the caller its slot was
+// released while the lease stayed held, so nothing short of re-reading status
+// could detect the leak. The status must be distinct from a generic failure,
+// and the lease must be reported as still held.
+func TestReturnDirtyNonTTYKeepsLeaseAndExitsNotReturned(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	lease := acquireLeaseJSON(t, repoDir, homeDir, "automation-A")
+
+	if err := os.WriteFile(filepath.Join(lease.Path, "stray.txt"), []byte("untracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, returnErr, code := runTreehouse(t, repoDir, homeDir, nil,
+		"return", "--if-lease-id", lease.LeaseID, lease.Path)
+	if code != ExitNotReturned {
+		t.Fatalf("expected exit %d for a dirty worktree left in place, got %d: %s", ExitNotReturned, code, returnErr)
+	}
+	if !strings.Contains(returnErr, "not returned") {
+		t.Fatalf("expected stderr to say the worktree was not returned, got: %s", returnErr)
+	}
+
+	statusOut, statusErr, code := runTreehouse(t, repoDir, homeDir, nil, "status", "--json")
+	if code != 0 {
+		t.Fatalf("status --json failed (code %d): %s", code, statusErr)
+	}
+	var entries []statusJSONResult
+	if err := json.Unmarshal([]byte(statusOut), &entries); err != nil {
+		t.Fatalf("status --json returned invalid JSON: %v\n%s", err, statusOut)
+	}
+	var held *statusJSONResult
+	for i := range entries {
+		if entries[i].Path == lease.Path {
+			held = &entries[i]
+		}
+	}
+	if held == nil {
+		t.Fatalf("leased worktree missing from status:\n%s", statusOut)
+	}
+	if held.Status != "leased" || held.LeaseID != lease.LeaseID {
+		t.Fatalf("expected the lease to survive an aborted return, got %+v", *held)
+	}
+}
+
+// --force is the documented way out of the aborted state, so the hint the
+// abort prints must actually clear it.
+func TestReturnForceClearsLeaseAfterDirtyAbort(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	lease := acquireLeaseJSON(t, repoDir, homeDir, "automation-A")
+
+	if err := os.WriteFile(filepath.Join(lease.Path, "stray.txt"), []byte("untracked\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, returnErr, code := runTreehouse(t, repoDir, homeDir, nil,
+		"return", "--if-lease-id", lease.LeaseID, lease.Path); code != ExitNotReturned {
+		t.Fatalf("expected the dirty return to abort, got %d: %s", code, returnErr)
+	}
+
+	_, returnErr, code := runTreehouse(t, repoDir, homeDir, nil,
+		"return", "--force", "--if-lease-id", lease.LeaseID, lease.Path)
+	if code != 0 {
+		t.Fatalf("return --force failed (code %d): %s", code, returnErr)
+	}
+
+	statusOut, statusErr, code := runTreehouse(t, repoDir, homeDir, nil, "status", "--json")
+	if code != 0 {
+		t.Fatalf("status --json failed (code %d): %s", code, statusErr)
+	}
+	var entries []statusJSONResult
+	if err := json.Unmarshal([]byte(statusOut), &entries); err != nil {
+		t.Fatalf("status --json returned invalid JSON: %v\n%s", err, statusOut)
+	}
+	for _, entry := range entries {
+		if entry.Path == lease.Path && entry.Status == "leased" {
+			t.Fatalf("expected return --force to clear the lease, got %+v", entry)
+		}
+	}
+}
+
+// get's exit-time return leaks a slot the same way an aborted `treehouse
+// return` does: the worktree stays dirty, so Acquire skips it and prune will
+// not reclaim it. Exit 0 reported that as a clean end of session.
+func TestGetLeavingWorktreeDirtyExitsNotReturned(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	// The subshell checks main out inside the worktree, so the main checkout
+	// has to be somewhere else.
+	gitCmd(t, repoDir, "checkout", "-b", "feature")
+
+	// The subshell checks out main and dirties it, so the exit-time
+	// confirmation is reached; the subprocess has no terminal to answer it.
+	env := []string{"SHELL=" + dirtyMainShellBin}
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	if code != ExitNotReturned {
+		t.Fatalf("expected exit %d when get leaves the worktree dirty, got %d: %s", ExitNotReturned, code, getErr)
+	}
+	if !strings.Contains(getErr, "prune will not reclaim this slot") {
+		t.Fatalf("expected get to explain the unreclaimable slot, got: %s", getErr)
+	}
+	if !strings.Contains(getErr, "return --force") {
+		t.Fatalf("expected a --force hint, got: %s", getErr)
+	}
+
+	wtPath := extractWorktreePath(getErr, homeDir)
+	if wtPath == "" {
+		t.Fatal("could not extract worktree path")
+	}
+	if status := gitCmd(t, wtPath, "status", "--porcelain"); status == "" {
+		t.Fatal("expected the worktree to stay dirty")
+	}
+
+	// The slot is unreclaimable exactly as the exit status reports: a second
+	// get has to burn a new one rather than recycle it.
+	_, secondErr, code := runTreehouse(t, repoDir, homeDir, []string{"SHELL=" + exitShellBin}, "get")
+	if code != 0 {
+		t.Fatalf("second get failed (code %d): %s", code, secondErr)
+	}
+	if secondPath := extractWorktreePath(secondErr, homeDir); secondPath == wtPath {
+		t.Fatalf("expected the dirty slot to be skipped, but it was handed out again: %s", secondPath)
+	}
+}
+
+func TestStatusFromInsideWorktreeReportsNoCallerProcesses(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	env := []string{"SHELL=" + exitShellBin}
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get failed (code %d): %s", code, getErr)
+	}
+	wtPath := extractWorktreePath(getErr, homeDir)
+	if wtPath == "" {
+		t.Fatal("could not extract worktree path")
+	}
+
+	slot := statusEntryForPath(t, repoDir, wtPath, homeDir, wtPath)
+	if procs := decodeStatusProcesses(t, slot.Processes); len(procs) != 0 {
+		t.Fatalf("expected no processes attributed to the slot the caller is standing in, got %+v", procs)
+	}
+	if slot.Status != "you're here" {
+		t.Fatalf("expected the slot the caller is standing in to read %q, got %q", "you're here", slot.Status)
+	}
+}
+
+// The column must not simply have been blanked: a process return would
+// terminate still has to be reported, from inside the worktree as much as
+// from outside it.
+func TestStatusFromInsideWorktreeReportsForeignProcesses(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	env := []string{"SHELL=" + exitShellBin}
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get failed (code %d): %s", code, getErr)
+	}
+	wtPath := extractWorktreePath(getErr, homeDir)
+	if wtPath == "" {
+		t.Fatal("could not extract worktree path")
+	}
+
+	foreignPID := startForeignWorktreeProcess(t, wtPath)
+
+	slot := statusEntryForPath(t, repoDir, wtPath, homeDir, wtPath)
+	procs := decodeStatusProcesses(t, slot.Processes)
+	var found bool
+	for _, proc := range procs {
+		if proc.PID == foreignPID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected the foreign process %d to be reported, got %+v", foreignPID, procs)
+	}
+
+	// From outside the worktree the same foreign process must still show, and
+	// the slot reads in-use rather than "you're here".
+	outside := statusEntryForPath(t, repoDir, repoDir, homeDir, wtPath)
+	if outside.Status != "in-use" {
+		t.Fatalf("expected a slot with a foreign process to read in-use from outside, got %q", outside.Status)
+	}
+}
+
+// startForeignWorktreeProcess runs a process whose cwd is the worktree and
+// which is not an ancestor of the treehouse subprocesses under test, so it is
+// exactly what return would terminate. It returns once the process reports it
+// is running.
+func startForeignWorktreeProcess(t *testing.T, wtPath string) int32 {
+	t.Helper()
+
+	signals := t.TempDir()
+	readyFile := filepath.Join(signals, "ready")
+	releaseFile := filepath.Join(signals, "release")
+
+	proc := exec.Command(waitShellBin)
+	proc.Dir = wtPath
+	proc.Env = append(os.Environ(),
+		"TREEHOUSE_TEST_READY="+readyFile,
+		"TREEHOUSE_TEST_RELEASE="+releaseFile,
+	)
+	if err := proc.Start(); err != nil {
+		t.Fatalf("failed to start a foreign worktree process: %v", err)
+	}
+	t.Cleanup(func() {
+		os.WriteFile(releaseFile, nil, 0o644)
+		proc.Wait()
+	})
+
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(readyFile); err == nil && len(b) > 0 {
+			return int32(proc.Process.Pid)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("the foreign worktree process never reported itself running")
+	return 0
+}
+
+// statusEntryForPath runs status --json from workDir and returns the entry for
+// wtPath.
+func statusEntryForPath(t *testing.T, repoDir, workDir, homeDir, wtPath string) statusJSONResult {
+	t.Helper()
+
+	statusOut, statusErr, code := runTreehouseFromDir(t, repoDir, workDir, homeDir, nil, "status", "--json")
+	if code != 0 {
+		t.Fatalf("status --json failed (code %d): %s", code, statusErr)
+	}
+	var entries []statusJSONResult
+	if err := json.Unmarshal([]byte(statusOut), &entries); err != nil {
+		t.Fatalf("status --json returned invalid JSON: %v\n%s", err, statusOut)
+	}
+	for _, entry := range entries {
+		if entry.Path == wtPath {
+			return entry
+		}
+	}
+	t.Fatalf("worktree %s missing from status:\n%s", wtPath, statusOut)
+	return statusJSONResult{}
+}
+
+func decodeStatusProcesses(t *testing.T, raw json.RawMessage) []statusJSONProcessResult {
+	t.Helper()
+	var procs []statusJSONProcessResult
+	if err := json.Unmarshal(raw, &procs); err != nil {
+		t.Fatalf("status processes %s is not a list of processes: %v", raw, err)
+	}
+	return procs
 }

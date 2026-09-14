@@ -59,6 +59,11 @@ type Backend interface {
 	GetRemoteURL(repoRoot string) (string, error)
 	// AddWorktree creates a new worktree at path based on branch.
 	AddWorktree(repoRoot, path, branch string) error
+	// SeedWorktree copies backend-specific ignored files into a new or recycled
+	// worktree and returns their paths so cleanup need not trust mutable worktree
+	// metadata. A nil manifest uses committed .worktreeinclude at the destination
+	// HEAD; a non-nil manifest replaces it, with an empty slice selecting nothing.
+	SeedWorktree(repoRoot, worktreePath string, manifest []byte) ([]string, error)
 	// PruneWorktrees clears bookkeeping for worktrees whose directories no
 	// longer exist. It never touches live worktrees or their data.
 	PruneWorktrees(repoRoot string) error
@@ -71,6 +76,9 @@ type Backend interface {
 	// ResetWorktree returns a worktree to a pristine checkout of branch,
 	// discarding local modifications.
 	ResetWorktree(worktreePath, branch string) error
+	// ResetWorktreeWithSeededPaths resets a worktree after removing its trusted
+	// seed inventory. A nil inventory does not authorize ignored-file deletion.
+	ResetWorktreeWithSeededPaths(worktreePath, branch string, seededPaths []string) error
 	// ResetWorktreeToRef resets worktreePath to an already resolved commit.
 	// Callers that verified safety must pass the reset target and worktree
 	// HEAD returned by IsWorktreeSafeToReset. The reset re-reads HEAD and,
@@ -79,6 +87,10 @@ type Backend interface {
 	// work is not discarded. Refuse if HEAD changed, the lock cannot be
 	// taken, or (when requireClean) the tree is dirty.
 	ResetWorktreeToRef(worktreePath, ref, expectedHead string, requireClean bool) error
+	// ResetWorktreeToRefWithSeededPaths applies the same guarded reset after
+	// removing the trusted seed inventory. A nil inventory does not authorize
+	// ignored-file deletion.
+	ResetWorktreeToRefWithSeededPaths(worktreePath, ref, expectedHead string, requireClean bool, seededPaths []string) error
 	// IsWorktreeSafeToReset reports whether worktreePath can be reset to
 	// branch without discarding committed work. It returns the immutable
 	// reset target and the worktree HEAD recorded at check time. Callers
@@ -266,6 +278,44 @@ func GetRemoteURL(repoRoot string) (string, error) {
 	return backendFor(repoRoot).GetRemoteURL(repoRoot)
 }
 
+// CheckedOutBranch reports which branch a pool slot is on, so callers can see
+// what work is in a slot without a second git command.
+//
+// Like VerifyBaseBranch it sits outside the Backend interface: reading a
+// checked-out branch is git-specific, and jj slots answer with an empty string
+// rather than a guess. The three outcomes are distinct: a branch name, a
+// detached HEAD reported with detached=true (the default `treehouse get`
+// state), and a genuine read error reported as err - never collapsed into the
+// empty string reserved for detached.
+//
+// Only a slot whose OWN marker names git is read. A markerless (damaged) slot
+// is never touched, so the branch of a repository enclosing the pool can never
+// be inherited and reported as the slot's. A marker that exists but cannot be
+// read is a genuine read failure, not a markerless slot, so that error is
+// propagated rather than discarded.
+func CheckedOutBranch(worktreePath string) (branch string, detached bool, err error) {
+	name, err := WorktreeBackendNameChecked(worktreePath)
+	if err != nil {
+		return "", false, err
+	}
+	switch name {
+	case "git":
+		branch, err := gitvcs.CheckedOutBranch(worktreePath)
+		if err != nil {
+			return "", false, err
+		}
+		if branch == "" {
+			return "", true, nil
+		}
+		return branch, false, nil
+	default:
+		// jj slots and markerless (damaged) slots report no branch: a jj
+		// workspace has no branch to name, and a markerless slot must never
+		// inherit the branch of a repository enclosing the pool.
+		return "", false, nil
+	}
+}
+
 // VerifyBaseBranch checks that an explicitly requested base branch resolves,
 // before anything is created or reset. An unresolvable base is an error rather
 // than a fallback to the inferred default, which would hand back a worktree cut
@@ -315,23 +365,57 @@ func RemoveCleanWorktree(repoRoot, path string) error {
 // colocated), so the marker identifies what the slot actually is regardless
 // of the repository's configured backend.
 func slotMarkerBackend(path string) Backend {
-	if _, err := os.Stat(filepath.Join(path, ".git")); err == nil {
+	name, _ := WorktreeBackendNameChecked(path)
+	switch name {
+	case "git":
 		return gitBackend
-	}
-	if info, err := os.Stat(filepath.Join(path, ".jj")); err == nil && info.IsDir() {
+	case "jj":
 		return jjBackend
 	}
 	return nil
 }
 
-// backendForWorktree dispatches per-worktree operations - the facts that
-// gate destructive decisions (dirty, merged, main-root) and the actions on a
-// slot's own state (reset, detach) - on what the worktree actually is. The
-// configured backend must not answer for a slot of the other flavor: a
-// .jj-only slot inspected through git resolves the repository ENCLOSING the
-// pool, and with an in-project pool root a clean enclosing repo makes dirty
-// jj work classify as disposable. Paths without a marker (ordinary
-// directories inside a repository) keep the configured-backend resolution.
+// slotMarkerBackend reports the backend a worktree's own marker names: a
+// .git entry means a git worktree, a .jj directory means a jj workspace.
+// Pool slots hold exactly one of the two (jj workspaces are never
+// colocated), so the marker identifies what the slot actually is regardless
+func WorktreeBackendNameChecked(path string) (string, error) {
+	if present, err := markerPresent(filepath.Join(path, ".git")); err != nil {
+		return "", err
+	} else if present {
+		if _, err := os.Stat(filepath.Join(path, ".git")); err != nil {
+			return "", fmt.Errorf("resolving .git marker in %s: %w", path, err)
+		}
+		return "git", nil
+	}
+	if present, err := markerPresent(filepath.Join(path, ".jj")); err != nil {
+		return "", err
+	} else if present {
+		info, err := os.Stat(filepath.Join(path, ".jj"))
+		if err != nil {
+			return "", fmt.Errorf("resolving .jj marker in %s: %w", path, err)
+		}
+		if info.IsDir() {
+			return "jj", nil
+		}
+	}
+	return "", nil
+}
+
+// markerPresent reports whether path itself exists, without following
+// symlinks. A dangling symlink is present: the entry is on disk and its
+// unresolvable target is a read failure for the caller to surface, not a
+// missing marker. Only a genuinely absent entry returns false with a nil
+// error.
+func markerPresent(path string) (bool, error) {
+	if _, err := os.Lstat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
 func backendForWorktree(path string) Backend {
 	if b := slotMarkerBackend(path); b != nil {
 		return b
@@ -375,6 +459,28 @@ func ResetWorktree(worktreePath, branch string) error {
 	return b.ResetWorktree(worktreePath, branch)
 }
 
+// ResetWorktreeWithSeededPaths resets after removing trusted seeded files.
+func ResetWorktreeWithSeededPaths(worktreePath, branch string, seededPaths []string) error {
+	b, err := destructiveBackendForWorktree(worktreePath)
+	if err != nil {
+		return err
+	}
+	return b.ResetWorktreeWithSeededPaths(worktreePath, branch, seededPaths)
+}
+
+// SeedWorktree delegates to Backend.SeedWorktree with the supplied manifest.
+func SeedWorktree(repoRoot, worktreePath string, manifest []byte) ([]string, error) {
+	return backendFor(repoRoot).SeedWorktree(repoRoot, worktreePath, manifest)
+}
+
+func JJSeedAuthenticationIdentity(worktreePath string) (string, error) {
+	return gitvcs.JJSeedAuthenticationIdentity(worktreePath)
+}
+
+func RemoveStaleJJSeedAuthentication(worktreePath, expectedIdentity string) error {
+	return gitvcs.RemoveStaleJJSeedAuthentication(worktreePath, expectedIdentity)
+}
+
 // ResetWorktreeToRef resets worktreePath to an already resolved commit.
 func ResetWorktreeToRef(worktreePath, ref, expectedHead string, requireClean bool) error {
 	b, err := destructiveBackendForWorktree(worktreePath)
@@ -382,6 +488,15 @@ func ResetWorktreeToRef(worktreePath, ref, expectedHead string, requireClean boo
 		return err
 	}
 	return b.ResetWorktreeToRef(worktreePath, ref, expectedHead, requireClean)
+}
+
+// ResetWorktreeToRefWithSeededPaths resets after removing trusted seeded files.
+func ResetWorktreeToRefWithSeededPaths(worktreePath, ref, expectedHead string, requireClean bool, seededPaths []string) error {
+	b, err := destructiveBackendForWorktree(worktreePath)
+	if err != nil {
+		return err
+	}
+	return b.ResetWorktreeToRefWithSeededPaths(worktreePath, ref, expectedHead, requireClean, seededPaths)
 }
 
 // IsWorktreeSafeToReset reports whether worktreePath can be reset to branch

@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,6 +25,7 @@ var (
 	getJSON        bool
 	getNoFetch     bool
 	getBase        string
+	getIncludeFile string
 	getUniqueLeaf  bool
 )
 
@@ -52,6 +54,12 @@ over in detached HEAD; --base chooses the commit it starts at, it does not
 create or check out a branch. A base that cannot be resolved is an error, never
 a silent fall back to the inferred default.
 
+Pass --include-file <path> to replace committed .worktreeinclude for this
+acquisition. Relative paths use the current directory; patterns inside the file
+select ignored, untracked files from the main checkout root. A missing or
+unreadable file fails before a worktree is created or reset. An empty file
+seeds nothing. Without the flag, only the committed manifest is used.
+
 Every pool slot normally lives in a directory named after the repository, so
 tooling that derives per-checkout identity from the working directory's last
 path segment sees every slot as the same checkout. Pass --unique-leaf, set
@@ -68,6 +76,7 @@ func init() {
 	getCmd.Flags().BoolVar(&getNoFetch, "no-fetch", false, "Skip fetching origin before acquiring; use existing local refs")
 	// No -b shorthand: git spells branch creation -b, and this creates nothing.
 	getCmd.Flags().StringVar(&getBase, "base", "", "Branch to cut this worktree from, overriding base_branch in config (default: inferred from the repository)")
+	getCmd.Flags().StringVar(&getIncludeFile, "include-file", "", "Replace committed .worktreeinclude with this file (relative to the current directory)")
 	getCmd.Flags().BoolVar(&getUniqueLeaf, "unique-leaf", false, "Name a newly created worktree directory <repo>-<slot> instead of <repo>, overriding unique_leaf in config")
 	rootCmd.AddCommand(getCmd)
 }
@@ -75,6 +84,16 @@ func init() {
 func getRunE(cmd *cobra.Command, args []string) error {
 	if getJSON && !getLease {
 		return fmt.Errorf("--json requires --lease")
+	}
+
+	var manifest []byte
+	if cmd.Flags().Changed("include-file") {
+		// Read once before acquisition can reset the checkout holding this file.
+		var err error
+		manifest, err = os.ReadFile(getIncludeFile)
+		if err != nil {
+			return fmt.Errorf("failed to read include file %q: %w", getIncludeFile, err)
+		}
 	}
 
 	repoRoot, err := vcs.FindRepoRoot()
@@ -101,9 +120,10 @@ func getRunE(cmd *cobra.Command, args []string) error {
 	}
 
 	acquireOpts := pool.AcquireOptions{
-		SkipFetch:  getNoFetch,
-		BaseBranch: resolveRequestedBase(cfg),
-		UniqueLeaf: resolveUniqueLeaf(cmd, cfg),
+		SkipFetch:       getNoFetch,
+		BaseBranch:      resolveRequestedBase(cfg),
+		IncludeManifest: manifest,
+		UniqueLeaf:      resolveUniqueLeaf(cmd, cfg),
 	}
 
 	if getLease {
@@ -122,14 +142,32 @@ func getRunE(cmd *cobra.Command, args []string) error {
 	}
 	_, err = shell.Spawn(wtPath, env)
 
-	// Subshell exited — handle return. A markerless slot must never be
-	// detached: dispatch on such a path falls back to the configured backend,
-	// which in an in-project pool would detach the HEAD of the repository
-	// ENCLOSING the pool.
-	if vcs.WorktreeBackendName(wtPath) != "" {
-		if err := vcs.DetachWorktree(wtPath); err != nil {
-			fmt.Fprintf(os.Stderr, "🌳 Warning: failed to detach worktree HEAD: %v\n", err)
+	// Subshell exited — handle return, but only while the slot still carries
+	// this session's own reservation. A 'treehouse lease' taken over this
+	// worktree while the shell was live replaces that reservation with a
+	// durable lease, and returning anyway would reset the tree and clear the
+	// lease that was protecting it. The detach runs under the same state lock
+	// as this check so a takeover cannot land between them and move the HEAD of
+	// a home the lease was protecting; the release below re-checks under its
+	// own lock, which keeps the dirty prompt and the reset off the slot too.
+	ownReservation := pool.ReleasePreconditions{RequireOwnedByCaller: true}
+	if err := pool.ValidateReleasePreconditions(poolDir, wtPath, ownReservation, func() error {
+		// A markerless slot must never be detached: dispatch on such a path
+		// falls back to the configured backend, which in an in-project pool
+		// would detach the HEAD of the repository ENCLOSING the pool.
+		if vcs.WorktreeBackendName(wtPath) == "" {
+			return nil
 		}
+		if err := vcs.DetachWorktree(wtPath); err != nil {
+			return fmt.Errorf("failed to detach worktree HEAD: %w", err)
+		}
+		return nil
+	}); err != nil {
+		if errors.Is(err, pool.ErrOwnerPreconditionFailed) {
+			fmt.Fprintf(os.Stderr, "🌳 Not returning %s to the pool: %v; leaving it exactly as it is.\n", ui.PrettyPath(wtPath), err)
+			return nil
+		}
+		fmt.Fprintf(os.Stderr, "🌳 Warning: %v\n", err)
 	}
 
 	dirty, _ := vcs.IsDirty(wtPath)
@@ -138,12 +176,23 @@ func getRunE(cmd *cobra.Command, args []string) error {
 
 		ok, promptErr := ui.Confirm("Clean worktree and return to pool?", true)
 		if promptErr != nil || !ok {
-			fmt.Fprintln(os.Stderr, "🌳 Worktree left dirty. Use 'treehouse return --force' to clean it later.")
-			return nil
+			// The same starvation an aborted `return` causes: the slot stays
+			// dirty, so Acquire skips it and prune will not reclaim it. The
+			// two ErrOwnerPreconditionFailed arms either side of this check
+			// still exit 0 because a slot another session durably leased was
+			// never this session's to return - not returning it is the
+			// designed outcome.
+			return withExitCode(ExitNotReturned, fmt.Errorf(
+				"🌳 worktree left dirty and not returned to the pool; prune will not reclaim this slot. Use treehouse return --force %s to clean it later",
+				quoteReturnPath(wtPath)))
 		}
 	}
 
-	if err := returnWorktreeToPool(poolDir, wtPath, releaseBaseBranch(repoRoot, cfg)); err != nil {
+	if err := returnWorktreeToPool(poolDir, wtPath, releaseBaseBranch(repoRoot, cfg), ownReservation); err != nil {
+		if errors.Is(err, pool.ErrOwnerPreconditionFailed) {
+			fmt.Fprintf(os.Stderr, "🌳 Not returning %s to the pool: %v; leaving it exactly as it is.\n", ui.PrettyPath(wtPath), err)
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "🌳 Warning: %v; leaving worktree in place.\n", err)
 		return err
 	}
@@ -157,8 +206,8 @@ func getRunE(cmd *cobra.Command, args []string) error {
 // as the release's beforeReset step, under the same state lock and immediately
 // before the reset, so a writer that re-enters the worktree cannot slip between
 // the emptiness check and the destructive reset.
-func returnWorktreeToPool(poolDir, wtPath, baseBranch string) error {
-	return pool.ReleaseConditional(poolDir, wtPath, baseBranch, pool.ReleasePreconditions{}, func() error {
+func returnWorktreeToPool(poolDir, wtPath, baseBranch string, preconditions pool.ReleasePreconditions) error {
+	return pool.ReleaseConditional(poolDir, wtPath, baseBranch, preconditions, func() error {
 		return killLingeringProcesses(wtPath)
 	})
 }

@@ -27,6 +27,9 @@ type statusJSONWorktree struct {
 	Name        string              `json:"name"`
 	Path        string              `json:"path"`
 	Status      string              `json:"status"`
+	Branch      string              `json:"branch"`
+	Detached    bool                `json:"detached,omitempty"`
+	BranchErr   string              `json:"branch_error,omitempty"`
 	Flavor      string              `json:"flavor,omitempty"`
 	LeaseID     string              `json:"lease_id"`
 	LeaseHolder string              `json:"lease_holder"`
@@ -76,7 +79,8 @@ var statusCmd = &cobra.Command{
 			return nil
 		}
 
-		// statusWidth must be >= longest status string ("you're here" = 11)
+		// statusWidth must be >= longest status string ("you're here" = 11;
+		// "unverified" = 10)
 		const statusWidth = 11
 
 		for _, wt := range worktrees {
@@ -94,11 +98,22 @@ var statusCmd = &cobra.Command{
 				status = cyan(wt.Status)
 			case pool.StatusDamaged:
 				status = red(wt.Status)
+			case pool.StatusUnverified:
+				status = red(wt.Status)
 			}
 
 			// "%-4s  %-11s  " = 4 + 2 + 11 + 2 = 19 chars before path
 			statusPad := strings.Repeat(" ", statusWidth-len(wt.Status))
 			line := fmt.Sprintf("%-4s  %s%s  %s", wt.Name, status, statusPad, ui.PrettyPath(wt.Path))
+			if wt.Branch != "" {
+				line += fmt.Sprintf("  [%s]", wt.Branch)
+			}
+			if wt.Detached {
+				line += "  (detached)"
+			}
+			if wt.BranchErr != "" {
+				line += yellow(fmt.Sprintf("  (branch unreadable: %s)", wt.BranchErr))
+			}
 			if wt.Status == pool.StatusLeased && wt.LeaseHolder != "" {
 				line += fmt.Sprintf("  (held by %s)", wt.LeaseHolder)
 			}
@@ -106,7 +121,11 @@ var statusCmd = &cobra.Command{
 				line += yellow(fmt.Sprintf("  (%s-flavored; repo selects %s — destroy to migrate)", wt.Flavor, repoFlavor))
 			}
 			if wt.Status == pool.StatusDamaged {
-				line += yellow(fmt.Sprintf("  (no .git or .jj marker — 'treehouse destroy %s --include-unlanded' to remove)", ui.PrettyPath(wt.Path)))
+				if wt.LeaseHolder != "" {
+					line += yellow(fmt.Sprintf("  (marker unreadable — 'treehouse destroy %s --include-leased --include-unlanded --yes' to remove)", ui.PrettyPath(wt.Path)))
+				} else {
+					line += yellow(fmt.Sprintf("  (no .git or .jj marker — 'treehouse destroy %s --include-unlanded' to remove)", ui.PrettyPath(wt.Path)))
+				}
 			}
 			fmt.Fprintln(os.Stdout, line)
 
@@ -153,6 +172,9 @@ func writeStatusJSON(worktrees []pool.WorktreeStatus) error {
 			Name:        wt.Name,
 			Path:        wt.Path,
 			Status:      wt.Status,
+			Branch:      wt.Branch,
+			Detached:    wt.Detached,
+			BranchErr:   wt.BranchErr,
 			Flavor:      wt.Flavor,
 			LeaseID:     wt.LeaseID,
 			LeaseHolder: wt.LeaseHolder,

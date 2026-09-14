@@ -52,6 +52,13 @@ const destroyGracePeriod = 2 * time.Second
 var findProcessesInWorktree = process.FindProcessesInWorktree
 var terminateWorktreeProcesses = process.TerminateWorktreeProcesses
 
+// dropProtectedProcesses removes the caller and its ancestors from a scanned
+// list, leaving the set `return` would terminate. List filters with it so
+// status and return agree on what is attached to a slot, and applies it to the
+// scan it already ran so a failed process-table read stays distinguishable
+// from a failed ancestry walk.
+var dropProtectedProcesses = process.DropProtectedProcesses
+
 type destroyReservation struct {
 	worktree               WorktreeEntry
 	originalOwnerPID       int32
@@ -129,6 +136,8 @@ type DestroyOptions struct {
 	IncludeLeased bool
 	// PreDestroy is the hook command list to run before deleting each worktree.
 	PreDestroy []string
+	// InspectTargets observes the locked target snapshot used by bulk destroy.
+	InspectTargets func([]WorktreeEntry)
 }
 
 // DestroyWorktree plans or removes a single named managed worktree. Because the
@@ -141,7 +150,10 @@ func DestroyWorktree(poolDir, worktreePath string, opts DestroyOptions) (Destroy
 		if err != nil {
 			return err
 		}
-		state = healState(state)
+		state, err = healState(poolDir, state)
+		if err != nil {
+			return err
+		}
 		if err := WriteState(poolDir, state); err != nil {
 			return err
 		}
@@ -174,11 +186,17 @@ func DestroyPool(poolDir string, opts DestroyOptions) (DestroyResult, error) {
 		if err != nil {
 			return err
 		}
-		state = healState(state)
+		state, err = healState(poolDir, state)
+		if err != nil {
+			return err
+		}
 		if err := WriteState(poolDir, state); err != nil {
 			return err
 		}
 		targets = append([]WorktreeEntry(nil), state.Worktrees...)
+		if opts.InspectTargets != nil {
+			opts.InspectTargets(append([]WorktreeEntry(nil), targets...))
+		}
 		return nil
 	}); err != nil {
 		return DestroyResult{}, err
@@ -389,7 +407,10 @@ func executeDestroy(poolDir string, removable []DestroyTarget, repoRoot, default
 		if err != nil {
 			return err
 		}
-		state = healState(state)
+		state, err = healState(poolDir, state)
+		if err != nil {
+			return err
+		}
 		for i := range state.Worktrees {
 			if _, ok := plannedByPath[state.Worktrees[i].Path]; !ok {
 				continue
